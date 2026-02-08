@@ -1,12 +1,17 @@
 const API_URL = "http://127.0.0.1:5000/api";
+// Replace with your actual contract address after deploying ImpactForge.sol in Remix
+const CONTRACT_ADDRESS = "0xd9145CCE52D386f254917e481eB44e9943F39138"; 
+const ABI = [
+    "function acceptSolution(uint _problemId, address _student) public",
+    "function getStudentCerts(address _student) public view returns (tuple(uint id, uint problemId, address student, uint timestamp, string achievement)[])"
+];
+
 let currentUser = null;
 let globalProblems = [];
 let activeChatProblemId = null;
 let chatInterval = null;
 
-// ==================================================================
-// 1. AUTHENTICATION
-// ==================================================================
+// 1. AUTHENTICATION (REMOVED MANDATORY WALLET)
 
 function switchAuthTab(tab) {
     if(tab === 'login') {
@@ -27,15 +32,23 @@ async function handleRegister(e) {
     const user = document.getElementById('rUser').value;
     const pass = document.getElementById('rPass').value;
     const role = document.getElementById('rRole').value;
+    
     try {
         const res = await fetch(`${API_URL}/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: user, password: pass, role: role })
+            body: JSON.stringify({ 
+                username: user, 
+                password: pass, 
+                role: role
+            })
         });
-        if(res.ok) { alert("Account Created!"); switchAuthTab('login'); }
-        else { alert("Error registering"); }
-    } catch (err) { alert("Backend offline?"); }
+        if(res.ok) { alert("Account Created! You can now login."); switchAuthTab('login'); }
+        else { 
+            const errorData = await res.json();
+            alert("Error: " + (errorData.error || "Username might be taken.")); 
+        }
+    } catch (err) { alert("Backend offline? Ensure run.py is active."); }
 }
 
 async function handleLogin(e) {
@@ -49,16 +62,18 @@ async function handleLogin(e) {
             body: JSON.stringify({ username: user, password: pass })
         });
         const data = await res.json();
-        if(res.ok) { currentUser = data; initDashboard(); }
-        else { alert(data.error); }
+        if(res.ok) { 
+            currentUser = data; 
+            initDashboard(); 
+        } else { 
+            alert(data.error); 
+        }
     } catch (err) { alert("Backend offline?"); }
 }
 
 function logout() { location.reload(); }
 
-// ==================================================================
 // 2. DASHBOARD
-// ==================================================================
 
 function initDashboard() {
     document.getElementById('authScreen').classList.add('hidden');
@@ -77,13 +92,10 @@ function showSection(id) {
     document.getElementById('view-profile').classList.add('hidden');
     document.getElementById(`view-${id}`).classList.remove('hidden');
     
-    // Load Profile Data if that section is active
     if(id === 'profile') loadMyBadges();
 }
 
-// ==================================================================
 // 3. PROBLEMS & CHAT
-// ==================================================================
 
 async function loadProblems() {
     const res = await fetch(`${API_URL}/problems`);
@@ -94,7 +106,6 @@ async function loadProblems() {
     globalProblems.forEach(p => {
         let actionArea = "";
         
-        // --- STUDENT LOGIC ---
         if(currentUser.role === 'student') {
             if(p.status === 'Open') {
                 actionArea = `
@@ -103,17 +114,13 @@ async function loadProblems() {
                         <button onclick="submitSolution(${p.id})" class="btn-sm">Submit</button>
                     </div>`;
             } else if(p.solver_name === currentUser.username && p.status === 'Pending Review') {
-                // Pending Review: Show Chat & Re-Upload
                 actionArea = `
                     <div class="action-box pending">
                         <p><strong>Under Review</strong></p>
-                        <input type="text" id="sol-${p.id}" value="${p.solution_link}" style="margin-bottom:5px;">
-                        <button onclick="submitSolution(${p.id})" class="btn-sm" style="background:#eab308;">Re-Upload</button>
                         <button onclick="openChat(${p.id}, '${p.ngo_name}')" class="btn-chat"><i class="fa-solid fa-comments"></i> Chat with NGO</button>
                     </div>`;
             }
         } 
-        // --- NGO LOGIC ---
         else if(currentUser.role === 'ngo' && p.ngo_name === currentUser.username) {
             if(p.status === 'Pending Review') {
                 actionArea = `
@@ -200,7 +207,22 @@ async function sendMessage() {
     loadMessages();
 }
 
-// --- CORE ACTIONS ---
+// 4. CORE ACTIONS & BLOCKCHAIN 
+
+async function connectWallet() {
+    if (!window.ethereum) {
+        alert("Please install MetaMask!");
+        return null;
+    }
+    try {
+        const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+        return accounts[0];
+    } catch (e) {
+        alert("Wallet connection failed.");
+        return null;
+    }
+}
+
 async function postProblem(e) {
     e.preventDefault();
     const title = document.getElementById('pTitle').value;
@@ -220,28 +242,68 @@ async function postProblem(e) {
 async function submitSolution(probId) {
     const link = document.getElementById(`sol-${probId}`).value;
     if(!link) return alert("Please paste a link!");
+    
+    // Students can optionally provide their wallet here for the NGO to see
+    let wallet = null;
+    if(confirm("Would you like to link your MetaMask wallet for on-chain certification?")) {
+        wallet = await connectWallet();
+    }
+
     await fetch(`${API_URL}/submit_solution`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ problem_id: probId, user_id: currentUser.id, solution_link: link })
+        body: JSON.stringify({ 
+            problem_id: probId, 
+            user_id: currentUser.id, 
+            solution_link: link,
+            wallet_address: wallet 
+        })
     });
-    alert("Solution Submitted/Updated!");
+    alert("Solution Submitted!");
     loadProblems();
 }
 
 async function acceptSolution(probId) {
-    await fetch(`${API_URL}/accept_solution`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ problem_id: probId, tx_hash: "0x"+Math.random().toString(16).substr(2,40) })
-    });
-    alert("Accepted! Certificate Issued.");
-    loadProblems();
+    if (!window.ethereum) return alert("Please install MetaMask to certify this on the blockchain!");
+
+    try {
+        const provider = new ethers.providers.Web3Provider(window.ethereum);
+        await provider.send("eth_requestAccounts", []);
+        const signer = provider.getSigner();
+        const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+
+        const problem = globalProblems.find(p => p.id === probId);
+        
+        let studentWallet = problem.solver_wallet;
+        if (!studentWallet) {
+            studentWallet = prompt("The student didn't provide a wallet address. Please paste their wallet address manually to issue the certificate:");
+        }
+        
+        if (!studentWallet) return alert("Certification cancelled: No student wallet address.");
+
+        const tx = await contract.acceptSolution(probId, studentWallet);
+        alert("Transaction sent! Waiting for confirmation...");
+        
+        const receipt = await tx.wait(); 
+
+        await fetch(`${API_URL}/accept_solution`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                problem_id: probId, 
+                tx_hash: receipt.transactionHash 
+            })
+        });
+
+        alert("Solution Accepted & Certified on Blockchain!");
+        loadProblems();
+    } catch (err) {
+        console.error("Blockchain Error:", err);
+        alert("Transaction failed: " + err.message);
+    }
 }
 
-// ==================================================================
-// 4. PROFILE & CERTIFICATES (FIXED FOR NGO)
-// ==================================================================
+// 5. PROFILE & CERTIFICATES
 
 function loadMyBadges() {
     const container = document.getElementById('badgesContainer');
@@ -250,26 +312,15 @@ function loadMyBadges() {
     
     container.innerHTML = "";
 
-    // --- NGO LOGIC: Show "Problems Posted" ---
     if(currentUser.role === 'ngo') {
         label.innerText = "Problems Posted";
-        
         const myPosts = globalProblems.filter(p => p.ngo_name === currentUser.username);
         score.innerText = myPosts.length;
-
-        container.innerHTML = `
-            <div style="text-align:center; padding:30px; color:#64748b;">
-                <i class="fa-solid fa-hand-holding-heart" style="font-size:3rem; margin-bottom:15px; display:block;"></i>
-                <p>NGOs track posted challenges here.</p>
-                <p><strong>Certificates are issued to Students only.</strong></p>
-            </div>
-        `;
+        container.innerHTML = `<p>NGOs track posted challenges here.</p>`;
         return;
     }
 
-    // --- STUDENT LOGIC: Show "Impact Badges" ---
     label.innerText = "Impact Badges";
-    
     const mySolved = globalProblems.filter(p => p.solver_name === currentUser.username && p.status === 'Solved');
     score.innerText = mySolved.length;
 
@@ -286,7 +337,7 @@ function loadMyBadges() {
                     <h4>${p.title}</h4>
                     <p class="badge-desc">Solved by <strong>${currentUser.username}</strong></p>
                     <div class="cert-download-area">
-                        <button onclick="downloadCertificate('${currentUser.username}', '${p.title}', '${p.ngo_name}')" class="btn-download">Download</button>
+                        <button onclick="downloadCertificate('${currentUser.username}', '${p.title}', '${p.ngo_name}')" class="btn-download">Download PDF</button>
                     </div>
                 </div>
             </div>`;
